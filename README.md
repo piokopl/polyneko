@@ -15,7 +15,6 @@ Automated trading bot for Polymarket 15-minute crypto prediction markets.
 pip install py-clob-client python-dotenv aiohttp
 
 # Configure
-cp env.polyneko.example .env
 nano .env  # Fill in your keys
 
 # Run
