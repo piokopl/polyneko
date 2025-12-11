@@ -93,6 +93,7 @@ class Config:
     trail_trigger: float = 0.10
     trail_size: float = 0.5
     max_hedges: int = 3
+    hedge_confirm_seconds: int = 5  # Drop must persist for X seconds before hedge
     
     # Order execution
     order_max_retries: int = 15          # FOK retries (more is safer)
@@ -151,6 +152,7 @@ class Config:
             trail_trigger=float(os.getenv("TRAIL_TRIGGER", "0.10")),
             trail_size=float(os.getenv("TRAIL_SIZE", "0.5")),
             max_hedges=int(os.getenv("MAX_HEDGES", "3")),
+            hedge_confirm_seconds=int(os.getenv("HEDGE_CONFIRM_SECONDS", "5")),
             
             # Signal
             signal_cooldown=int(os.getenv("SIGNAL_COOLDOWN", "30")),
@@ -234,6 +236,10 @@ class Position:
     
     # Initial prediction
     initial_side: str = ""          # What we predicted first
+    
+    # Hedge confirmation tracking
+    hedge_trigger_time: datetime = None  # When drop first detected
+    hedge_trigger_drop: float = 0.0      # Drop % when first detected
     
     @property
     def total_cost(self) -> float:
@@ -928,13 +934,13 @@ class PolyNeko:
             logger.debug(f"[{symbol}] Cooldown: {seconds_since_last:.0f}s < {self.config.signal_cooldown}s")
             return
         
-        # Check max position
-        if pos.total_cost >= self.config.max_position:
-            logger.debug(f"[{symbol}] Max position reached: ${pos.total_cost:.2f}")
-            return
-        
         # === INITIAL TRADE (no position yet) ===
         if len(pos.trades) == 0:
+            # Check max position only for initial trades
+            if pos.total_cost >= self.config.max_position:
+                logger.debug(f"[{symbol}] Max position reached: ${pos.total_cost:.2f}")
+                return
+                
             # Get momentum from Binance for initial direction
             momentum, _ = await self.binance.get_momentum(symbol)
             
@@ -955,7 +961,10 @@ class PolyNeko:
         
         # === TRAILING / HEDGE LOGIC ===
         if pos.hedge_count >= self.config.max_hedges:
+            logger.debug(f"[{symbol}] Max hedges reached: {pos.hedge_count}/{self.config.max_hedges}")
             return  # Max hedges reached
+        
+        now = datetime.now(timezone.utc)
         
         # Check if token price moved against us
         if pos.initial_side == "YES" and pos.yes_entry_price > 0:
@@ -963,24 +972,68 @@ class PolyNeko:
             price_drop = (pos.yes_entry_price - yes_price) / pos.yes_entry_price
             
             if price_drop >= self.config.trail_trigger:
-                # YES price dropped significantly - hedge with NO
-                await self.place_trade(
-                    pos, "NO", no_price, 
-                    f"HEDGE: YES ${pos.yes_entry_price:.2f}→${yes_price:.2f} (-{price_drop:.0%})",
-                    is_hedge=True
-                )
+                # Drop detected - check if it persists
+                if pos.hedge_trigger_time is None:
+                    # First time seeing drop - start timer
+                    pos.hedge_trigger_time = now
+                    pos.hedge_trigger_drop = price_drop
+                    logger.info(f"[{symbol}] ⏱️ HEDGE PENDING: YES dropped {price_drop:.0%}, waiting {self.config.hedge_confirm_seconds}s...")
+                else:
+                    # Check if enough time passed
+                    elapsed = (now - pos.hedge_trigger_time).total_seconds()
+                    if elapsed >= self.config.hedge_confirm_seconds:
+                        # Confirmed! Execute hedge
+                        logger.info(f"[{symbol}] 🛡️ HEDGE CONFIRMED: YES dropped {price_drop:.0%} for {elapsed:.0f}s")
+                        await self.place_trade(
+                            pos, "NO", no_price, 
+                            f"HEDGE: YES ${pos.yes_entry_price:.2f}→${yes_price:.2f} (-{price_drop:.0%})",
+                            is_hedge=True
+                        )
+                        # Reset trigger after hedge
+                        pos.hedge_trigger_time = None
+                        pos.hedge_trigger_drop = 0
+                    else:
+                        logger.debug(f"[{symbol}] YES drop={price_drop:.0%}, waiting... ({elapsed:.0f}s/{self.config.hedge_confirm_seconds}s)")
+            else:
+                # Drop recovered - reset timer
+                if pos.hedge_trigger_time is not None:
+                    logger.info(f"[{symbol}] ✅ DROP RECOVERED: YES back to ${yes_price:.3f} (was -{pos.hedge_trigger_drop:.0%})")
+                    pos.hedge_trigger_time = None
+                    pos.hedge_trigger_drop = 0
         
         elif pos.initial_side == "NO" and pos.no_entry_price > 0:
             # We bet NO, check if NO token price dropped
             price_drop = (pos.no_entry_price - no_price) / pos.no_entry_price
             
             if price_drop >= self.config.trail_trigger:
-                # NO price dropped significantly - hedge with YES
-                await self.place_trade(
-                    pos, "YES", yes_price,
-                    f"HEDGE: NO ${pos.no_entry_price:.2f}→${no_price:.2f} (-{price_drop:.0%})",
-                    is_hedge=True
-                )
+                # Drop detected - check if it persists
+                if pos.hedge_trigger_time is None:
+                    # First time seeing drop - start timer
+                    pos.hedge_trigger_time = now
+                    pos.hedge_trigger_drop = price_drop
+                    logger.info(f"[{symbol}] ⏱️ HEDGE PENDING: NO dropped {price_drop:.0%}, waiting {self.config.hedge_confirm_seconds}s...")
+                else:
+                    # Check if enough time passed
+                    elapsed = (now - pos.hedge_trigger_time).total_seconds()
+                    if elapsed >= self.config.hedge_confirm_seconds:
+                        # Confirmed! Execute hedge
+                        logger.info(f"[{symbol}] 🛡️ HEDGE CONFIRMED: NO dropped {price_drop:.0%} for {elapsed:.0f}s")
+                        await self.place_trade(
+                            pos, "YES", yes_price,
+                            f"HEDGE: NO ${pos.no_entry_price:.2f}→${no_price:.2f} (-{price_drop:.0%})",
+                            is_hedge=True
+                        )
+                        # Reset trigger after hedge
+                        pos.hedge_trigger_time = None
+                        pos.hedge_trigger_drop = 0
+                    else:
+                        logger.debug(f"[{symbol}] NO drop={price_drop:.0%}, waiting... ({elapsed:.0f}s/{self.config.hedge_confirm_seconds}s)")
+            else:
+                # Drop recovered - reset timer
+                if pos.hedge_trigger_time is not None:
+                    logger.info(f"[{symbol}] ✅ DROP RECOVERED: NO back to ${no_price:.3f} (was -{pos.hedge_trigger_drop:.0%})")
+                    pos.hedge_trigger_time = None
+                    pos.hedge_trigger_drop = 0
     
     async def place_trade(self, pos: Position, side: str, price: float, reason: str, is_hedge: bool = False):
         """Place a trade"""
@@ -992,12 +1045,12 @@ class PolyNeko:
         # Calculate size
         if is_hedge:
             bet_amount = self.config.bet_size * self.config.trail_size
+            # Hedge is always allowed (up to max_hedges limit checked earlier)
+            remaining = bet_amount  # No max_position limit for hedges
         else:
             bet_amount = self.config.bet_size
-        
-        # Check max position
-        remaining = self.config.max_position - pos.total_cost
-        bet_amount = min(bet_amount, remaining)
+            remaining = self.config.max_position - pos.total_cost
+            bet_amount = min(bet_amount, remaining)
         
         # Calculate shares
         shares = int(bet_amount / price)
@@ -1151,35 +1204,29 @@ class PolyNeko:
                     # Log full response for debugging
                     logger.debug(f"GTC full response: {resp}")
                     
-                    # Get actual fill price from response
-                    # For BUY: takingAmount = USDC spent, makingAmount = tokens received
-                    taking = float(resp.get('takingAmount', 0) or 0)
-                    making = float(resp.get('makingAmount', 0) or 0)
+                    # For BUY orders:
+                    # takingAmount = tokens received (what you take from market)
+                    # makingAmount = USDC paid (what you give/make)
+                    tokens_received = float(resp.get('takingAmount', 0) or 0)
+                    usdc_paid = float(resp.get('makingAmount', 0) or 0)
                     
-                    logger.debug(f"takingAmount={taking}, makingAmount={making}")
+                    logger.debug(f"tokens={tokens_received}, usdc={usdc_paid}")
                     
-                    if making > 0 and taking > 0:
-                        # Price = USDC / tokens
-                        actual_price = round(taking / making, 3)
-                        actual_shares = making
-                        
-                        # Sanity check - price should be 0-1 for prediction markets
-                        if actual_price > 1.0:
-                            logger.warning(f"Calculated price ${actual_price} > $1, using estimate")
-                            # Fallback: use orderbook price
-                            actual_price = self.orderbook.get_buy_price(token_id)
-                            if actual_price <= 0 or actual_price >= 1:
-                                actual_price = taking / shares if shares > 0 else 0.5
+                    if tokens_received > 0 and usdc_paid > 0:
+                        actual_price = round(usdc_paid / tokens_received, 3)
+                        actual_shares = tokens_received
+                        actual_cost = usdc_paid
                     else:
                         actual_price = self.orderbook.get_buy_price(token_id)
                         actual_shares = shares
+                        actual_cost = shares * actual_price
                     
                     resp['fill_price'] = actual_price
                     resp['fill_shares'] = actual_shares
-                    resp['fill_cost'] = taking
+                    resp['fill_cost'] = actual_cost
                     resp['attempts'] = 1
                     resp['order_type'] = 'GTC'
-                    logger.info(f"GTC filled @ ${actual_price:.3f} x {actual_shares:.1f} (${taking:.2f})")
+                    logger.info(f"GTC filled @ ${actual_price:.3f} x {actual_shares:.1f} (${actual_cost:.2f})")
                     return resp
                 else:
                     logger.warning(f"GTC order status: {status}")
