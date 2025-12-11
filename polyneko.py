@@ -1119,66 +1119,56 @@ class PolyNeko:
             await self.discord.send_trade(pos.symbol, side, shares, price, reason, is_hedge)
     
     def _send_order_sync(self, token_id: str, price: float, shares: int) -> dict:
-        """Synchronous order execution - FOK with retry"""
-        max_retries = self.config.order_max_retries
-        price_increment = self.config.order_price_increment
-        
-        current_price = round(price, 2)
+        """Synchronous order execution - GTC with high limit for best fill"""
         shares = int(shares)
         
         if shares < 5:
             return {'error': 'Shares below minimum (5)'}
         
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    current_price = round(current_price + price_increment, 2)
-                    time.sleep(0.3)  # Small delay between retries
-                
-                if current_price >= 0.99:
-                    return {'error': 'Price exceeded $0.99'}
-                
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=current_price,
-                    size=float(shares),
-                    side=BUY,
-                )
-                
-                signed_order = self.clob.create_order(order_args)
-                resp = self.clob.post_order(signed_order, OrderType.FOK)
-                
-                logger.debug(f"FOK attempt {attempt+1}/{max_retries} @ ${current_price:.2f} -> {resp}")
-                
-                if resp:
-                    status = resp.get('status', resp.get('orderStatus', '')).upper()
-                    success_flag = resp.get('success', False)
-                    
-                    logger.debug(f"Checking: status='{status}', success_flag={success_flag} (type={type(success_flag).__name__})")
-                    
-                    # Success if status=MATCHED/FILLED OR success=True
-                    if status in ['MATCHED', 'FILLED'] or success_flag == True:
-                        resp['fill_price'] = current_price
-                        resp['attempts'] = attempt + 1
-                        resp['order_type'] = 'FOK'
-                        logger.info(f"FOK filled @ ${current_price:.2f} (attempt {attempt+1})")
-                        return resp
-                    else:
-                        logger.debug(f"Condition not met: '{status}' in ['MATCHED','FILLED'] = {status in ['MATCHED', 'FILLED']}, success_flag={success_flag}")
-                
-                logger.debug(f"FOK attempt {attempt+1}/{max_retries}: Not filled @ ${current_price:.2f}")
-                    
-            except Exception as e:
-                error_msg = str(e)
-                if "couldn't be fully filled" in error_msg or "FOK" in error_msg:
-                    logger.debug(f"FOK attempt {attempt+1}/{max_retries}: Rejected @ ${current_price:.2f}")
-                elif "500" in error_msg or "could not run" in error_msg.lower():
-                    logger.warning(f"FOK attempt {attempt+1}/{max_retries}: Server error (500)")
-                    time.sleep(1)  # Wait after server error
-                else:
-                    logger.warning(f"FOK attempt {attempt+1}/{max_retries} error: {e}")
+        # Use limit price of $0.99 - will fill at best available price
+        limit_price = 0.99
         
-        return {'error': f'Order failed after {max_retries} attempts (last: ${current_price:.2f})'}
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=float(shares),
+                side=BUY,
+            )
+            
+            signed_order = self.clob.create_order(order_args)
+            resp = self.clob.post_order(signed_order, OrderType.GTC)
+            
+            logger.debug(f"GTC order @ ${limit_price:.2f} x {shares} -> {resp}")
+            
+            if resp:
+                status = resp.get('status', resp.get('orderStatus', '')).upper()
+                success_flag = resp.get('success', False)
+                
+                if status in ['MATCHED', 'FILLED'] or success_flag:
+                    # Get actual fill price from response
+                    taking = float(resp.get('takingAmount', 0) or 0)
+                    making = float(resp.get('makingAmount', 0) or 0)
+                    
+                    if taking > 0 and making > 0:
+                        actual_price = round(taking / making, 3)
+                    else:
+                        actual_price = limit_price
+                    
+                    resp['fill_price'] = actual_price
+                    resp['attempts'] = 1
+                    resp['order_type'] = 'GTC'
+                    logger.info(f"GTC filled @ ${actual_price:.3f} x {making:.1f}")
+                    return resp
+                else:
+                    logger.warning(f"GTC order status: {status}")
+                    return {'error': f'GTC order not filled: {status}'}
+            
+            return {'error': 'No response from GTC order'}
+                
+        except Exception as e:
+            logger.warning(f"GTC order error: {e}")
+            return {'error': str(e)}
     
     # ==================== SETTLEMENT ====================
     
