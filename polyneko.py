@@ -1066,11 +1066,13 @@ class PolyNeko:
                         self.stats['orders_filled'] += 1
                         
                         actual_price = result.get('fill_price', price)
-                        actual_cost = shares * actual_price
+                        actual_shares = result.get('fill_shares', shares)
+                        actual_cost = result.get('fill_cost', shares * actual_price)
                         
-                        logger.info(f"[{pos.symbol}] ✓ {side} @ ${actual_price:.3f} x {shares} = ${actual_cost:.2f} | {status} (attempt {attempts})")
+                        logger.info(f"[{pos.symbol}] ✓ {side} @ ${actual_price:.3f} x {actual_shares:.0f} = ${actual_cost:.2f} | {status}")
                         
                         price = actual_price
+                        shares = actual_shares
                         cost = actual_cost
                     else:
                         self.stats['orders_failed'] += 1
@@ -1146,19 +1148,38 @@ class PolyNeko:
                 success_flag = resp.get('success', False)
                 
                 if status in ['MATCHED', 'FILLED'] or success_flag:
+                    # Log full response for debugging
+                    logger.debug(f"GTC full response: {resp}")
+                    
                     # Get actual fill price from response
+                    # For BUY: takingAmount = USDC spent, makingAmount = tokens received
                     taking = float(resp.get('takingAmount', 0) or 0)
                     making = float(resp.get('makingAmount', 0) or 0)
                     
-                    if taking > 0 and making > 0:
+                    logger.debug(f"takingAmount={taking}, makingAmount={making}")
+                    
+                    if making > 0 and taking > 0:
+                        # Price = USDC / tokens
                         actual_price = round(taking / making, 3)
+                        actual_shares = making
+                        
+                        # Sanity check - price should be 0-1 for prediction markets
+                        if actual_price > 1.0:
+                            logger.warning(f"Calculated price ${actual_price} > $1, using estimate")
+                            # Fallback: use orderbook price
+                            actual_price = self.orderbook.get_buy_price(token_id)
+                            if actual_price <= 0 or actual_price >= 1:
+                                actual_price = taking / shares if shares > 0 else 0.5
                     else:
-                        actual_price = limit_price
+                        actual_price = self.orderbook.get_buy_price(token_id)
+                        actual_shares = shares
                     
                     resp['fill_price'] = actual_price
+                    resp['fill_shares'] = actual_shares
+                    resp['fill_cost'] = taking
                     resp['attempts'] = 1
                     resp['order_type'] = 'GTC'
-                    logger.info(f"GTC filled @ ${actual_price:.3f} x {making:.1f}")
+                    logger.info(f"GTC filled @ ${actual_price:.3f} x {actual_shares:.1f} (${taking:.2f})")
                     return resp
                 else:
                     logger.warning(f"GTC order status: {status}")
