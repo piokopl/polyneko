@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-POLYNEKO v2 - Directional Trading with Trailing
+POLYNEKO v3 - Advanced Directional Trading with Smart Hedging
 
 Strategy:
 - Monitor Polymarket token prices (YES/NO) via WebSocket
-- Make initial prediction based on Binance momentum
-- TRAILING: If token price moves against us, hedge by buying opposite side
-- Multiple bets per slot allowed
+- Make initial prediction based on Binance momentum + RSI + volume
+- Entry filters: spread check, volume check, RSI overbought/oversold, hour performance
+- HEDGE when ALL conditions are met:
+  1. Token price dropped X% from peak (dynamic trigger based on time left)
+  2. Binance price crossed start price (losing position)
+  3. Enough time left in slot (min_minutes_for_hedge)
+  4. Volume confirmation (optional)
+- Progressive hedge triggers: [10%, 20%, 30%] for hedge #1, #2, #3
+- Scaled hedge size based on drop magnitude
 
 """
 
@@ -89,11 +95,28 @@ class Config:
     bet_size: float = 25.0
     max_position: float = 200.0
     
-    # Trailing params
-    trail_trigger: float = 0.10
+    # Trailing/Hedge params
+    hedge_triggers: list = field(default_factory=lambda: [0.10, 0.20, 0.30])  # Multiple hedge levels
     trail_size: float = 0.5
     max_hedges: int = 3
     hedge_confirm_seconds: int = 5  # Drop must persist for X seconds before hedge
+    hedge_scale_with_drop: bool = True  # Scale hedge size with drop magnitude
+    min_minutes_for_hedge: int = 2  # Don't hedge if less than X minutes left
+    
+    # Dynamic trail trigger (based on time left in slot)
+    trail_trigger_early: float = 0.10   # >7 min left
+    trail_trigger_mid: float = 0.08     # 3-7 min left  
+    trail_trigger_late: float = 0.05    # <3 min left
+    
+    # Add to winner params
+    add_winner_enabled: bool = True
+    add_winner_min_minutes: float = 2.0    # Not earlier than X min before end
+    add_winner_max_minutes: float = 5.0    # Not later than X min before end  
+    add_winner_min_distance: float = 0.003 # Min 0.3% Binance distance from start
+    add_winner_min_token_price: float = 0.60  # Token must be "safe" (>60%)
+    add_winner_size: float = 0.5           # 50% of bet_size
+    add_winner_max_adds: int = 2           # Max additions per position
+    add_winner_confirm_seconds: int = 3    # Stability check duration
     
     # Order execution
     order_max_retries: int = 15          # FOK retries (more is safer)
@@ -102,6 +125,69 @@ class Config:
     
     # Signal params
     signal_cooldown: int = 30
+    min_momentum: float = 0.05  # Minimum momentum % for entry
+    
+    # Entry filters
+    rsi_period: int = 14
+    rsi_overbought: float = 70.0   # Don't buy YES if RSI > this
+    rsi_oversold: float = 30.0     # Don't buy NO if RSI < this
+    max_spread: float = 0.10       # Max spread (ask-bid) to trade
+    min_volume_ratio: float = 0.5  # Min volume vs average to trade
+    require_volume_for_hedge: bool = True  # Require volume spike for hedge
+    
+    # === NEW v4 INDICATORS ===
+    
+    # MACD (12, 26, 9)
+    use_macd: bool = True          # Use MACD confirmation
+    
+    # Stochastic (14, 3)
+    use_stochastic: bool = True
+    stoch_overbought: float = 80.0
+    stoch_oversold: float = 20.0
+    
+    # ADX - Average Directional Index
+    use_adx: bool = True
+    adx_min_strength: float = 20.0  # Skip if ADX < this (weak trend)
+    adx_strong: float = 25.0        # Strong trend threshold
+    
+    # Bollinger Bands
+    use_bb_squeeze: bool = True
+    bb_squeeze_threshold: float = 0.02  # Width < 2% = squeeze
+    
+    # ATR - dynamic parameters
+    use_atr_dynamic: bool = True
+    atr_base_multiplier: float = 1.5
+    
+    # Multi-timeframe analysis
+    use_mtf: bool = True  # Check 5m timeframe for trend confirmation
+    
+    # Divergence detection
+    use_divergence: bool = True
+    divergence_bonus: float = 0.15  # Confidence bonus for divergence
+    
+    # Session filter (UTC hours)
+    use_session_filter: bool = False  # Disabled by default - crypto 24/7
+    active_sessions: list = field(default_factory=lambda: [(8, 11), (13, 16), (19, 22)])
+    
+    # === CONFIDENCE SCORING ===
+    use_confidence_scoring: bool = True
+    min_confidence: float = 0.4     # Skip if confidence < 40%
+    high_confidence: float = 0.6    # Increase bet if confidence > 60%
+    high_confidence_multiplier: float = 1.5
+    
+    # === POSITION SIZING ===
+    use_dynamic_sizing: bool = True
+    win_streak_bonus: float = 0.1   # +10% per win (max +50%)
+    max_streak_bonus: float = 0.5   # Cap at +50%
+    
+    # === MARTINGALE PREVENTION ===
+    max_consecutive_losses: int = 3
+    loss_cooldown_seconds: int = 300  # 5 min cooldown after max losses
+    loss_size_reduction: float = 0.5  # Reduce bet to 50% after losses
+    
+    # Historical analysis
+    use_hour_filter: bool = True
+    min_hour_winrate: float = 40.0  # Skip hours with win rate below this
     
     # Symbols
     symbols: list = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
@@ -132,6 +218,10 @@ class Config:
         symbols_str = os.getenv("SYMBOLS", "BTC,ETH,SOL,XRP")
         symbols = [s.strip() for s in symbols_str.split(",") if s.strip()]
         
+        # Parse hedge triggers (comma-separated)
+        hedge_triggers_str = os.getenv("HEDGE_TRIGGERS", "0.10,0.20,0.30")
+        hedge_triggers = [float(x.strip()) for x in hedge_triggers_str.split(",")]
+        
         return cls(
             # API Keys
             polymarket_api_key=os.getenv("POLYMARKET_API_KEY", ""),
@@ -148,14 +238,77 @@ class Config:
             bet_size=float(os.getenv("BET_SIZE", "25")),
             max_position=float(os.getenv("MAX_POSITION", "200")),
             
-            # Trailing
-            trail_trigger=float(os.getenv("TRAIL_TRIGGER", "0.10")),
+            # Hedge params
+            hedge_triggers=hedge_triggers,
             trail_size=float(os.getenv("TRAIL_SIZE", "0.5")),
             max_hedges=int(os.getenv("MAX_HEDGES", "3")),
             hedge_confirm_seconds=int(os.getenv("HEDGE_CONFIRM_SECONDS", "5")),
+            hedge_scale_with_drop=os.getenv("HEDGE_SCALE_WITH_DROP", "true").lower() == "true",
+            min_minutes_for_hedge=int(os.getenv("MIN_MINUTES_FOR_HEDGE", "2")),
+            
+            # Dynamic trail trigger
+            trail_trigger_early=float(os.getenv("TRAIL_TRIGGER_EARLY", "0.10")),
+            trail_trigger_mid=float(os.getenv("TRAIL_TRIGGER_MID", "0.08")),
+            trail_trigger_late=float(os.getenv("TRAIL_TRIGGER_LATE", "0.05")),
+            
+            # Add to winner
+            add_winner_enabled=os.getenv("ADD_WINNER_ENABLED", "true").lower() == "true",
+            add_winner_min_minutes=float(os.getenv("ADD_WINNER_MIN_MINUTES", "2.0")),
+            add_winner_max_minutes=float(os.getenv("ADD_WINNER_MAX_MINUTES", "5.0")),
+            add_winner_min_distance=float(os.getenv("ADD_WINNER_MIN_DISTANCE", "0.003")),
+            add_winner_min_token_price=float(os.getenv("ADD_WINNER_MIN_TOKEN_PRICE", "0.60")),
+            add_winner_size=float(os.getenv("ADD_WINNER_SIZE", "0.5")),
+            add_winner_max_adds=int(os.getenv("ADD_WINNER_MAX_ADDS", "2")),
+            add_winner_confirm_seconds=int(os.getenv("ADD_WINNER_CONFIRM_SECONDS", "3")),
             
             # Signal
             signal_cooldown=int(os.getenv("SIGNAL_COOLDOWN", "30")),
+            min_momentum=float(os.getenv("MIN_MOMENTUM", "0.05")),
+            
+            # Entry filters
+            rsi_period=int(os.getenv("RSI_PERIOD", "14")),
+            rsi_overbought=float(os.getenv("RSI_OVERBOUGHT", "70")),
+            rsi_oversold=float(os.getenv("RSI_OVERSOLD", "30")),
+            max_spread=float(os.getenv("MAX_SPREAD", "0.10")),
+            min_volume_ratio=float(os.getenv("MIN_VOLUME_RATIO", "0.5")),
+            require_volume_for_hedge=os.getenv("REQUIRE_VOLUME_FOR_HEDGE", "true").lower() == "true",
+            
+            # NEW v4 indicators
+            use_macd=os.getenv("USE_MACD", "true").lower() == "true",
+            use_stochastic=os.getenv("USE_STOCHASTIC", "true").lower() == "true",
+            stoch_overbought=float(os.getenv("STOCH_OVERBOUGHT", "80")),
+            stoch_oversold=float(os.getenv("STOCH_OVERSOLD", "20")),
+            use_adx=os.getenv("USE_ADX", "true").lower() == "true",
+            adx_min_strength=float(os.getenv("ADX_MIN_STRENGTH", "20")),
+            adx_strong=float(os.getenv("ADX_STRONG", "25")),
+            use_bb_squeeze=os.getenv("USE_BB_SQUEEZE", "true").lower() == "true",
+            bb_squeeze_threshold=float(os.getenv("BB_SQUEEZE_THRESHOLD", "0.02")),
+            use_atr_dynamic=os.getenv("USE_ATR_DYNAMIC", "true").lower() == "true",
+            atr_base_multiplier=float(os.getenv("ATR_BASE_MULTIPLIER", "1.5")),
+            use_mtf=os.getenv("USE_MTF", "true").lower() == "true",
+            use_divergence=os.getenv("USE_DIVERGENCE", "true").lower() == "true",
+            divergence_bonus=float(os.getenv("DIVERGENCE_BONUS", "0.15")),
+            use_session_filter=os.getenv("USE_SESSION_FILTER", "false").lower() == "true",
+            
+            # Confidence scoring
+            use_confidence_scoring=os.getenv("USE_CONFIDENCE_SCORING", "true").lower() == "true",
+            min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.4")),
+            high_confidence=float(os.getenv("HIGH_CONFIDENCE", "0.6")),
+            high_confidence_multiplier=float(os.getenv("HIGH_CONFIDENCE_MULTIPLIER", "1.5")),
+            
+            # Dynamic sizing
+            use_dynamic_sizing=os.getenv("USE_DYNAMIC_SIZING", "true").lower() == "true",
+            win_streak_bonus=float(os.getenv("WIN_STREAK_BONUS", "0.1")),
+            max_streak_bonus=float(os.getenv("MAX_STREAK_BONUS", "0.5")),
+            
+            # Martingale prevention
+            max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")),
+            loss_cooldown_seconds=int(os.getenv("LOSS_COOLDOWN_SECONDS", "300")),
+            loss_size_reduction=float(os.getenv("LOSS_SIZE_REDUCTION", "0.5")),
+            
+            # Historical analysis
+            use_hour_filter=os.getenv("USE_HOUR_FILTER", "true").lower() == "true",
+            min_hour_winrate=float(os.getenv("MIN_HOUR_WINRATE", "40")),
             
             # Order execution
             order_max_retries=int(os.getenv("ORDER_MAX_RETRIES", "15")),
@@ -187,20 +340,47 @@ class Config:
     def print_config(self):
         """Print configuration summary"""
         logger.info("=" * 60)
-        logger.info("CONFIGURATION")
+        logger.info("CONFIGURATION (v4)")
         logger.info("=" * 60)
         logger.info(f"  Symbols: {', '.join(self.symbols)}")
         logger.info(f"  Bet Size: ${self.bet_size}")
         logger.info(f"  Max Position: ${self.max_position}")
-        logger.info(f"  Trail Trigger: {self.trail_trigger:.0%}")
-        logger.info(f"  Trail Size: {self.trail_size:.0%}")
-        logger.info(f"  Max Hedges: {self.max_hedges}")
-        logger.info(f"  Signal Cooldown: {self.signal_cooldown}s")
-        logger.info(f"  FOK Retries: {self.order_max_retries} (increment ${self.order_price_increment}, GTC fallback: {self.order_use_gtc_fallback})")
+        logger.info(f"  Hedge Triggers: {[f'{t:.0%}' for t in self.hedge_triggers]}")
+        logger.info(f"  Trail Size: {self.trail_size:.0%} (scale with drop: {self.hedge_scale_with_drop})")
+        logger.info(f"  Dynamic Trail: early={self.trail_trigger_early:.0%}, mid={self.trail_trigger_mid:.0%}, late={self.trail_trigger_late:.0%}")
+        logger.info(f"  Max Hedges: {self.max_hedges} (min {self.min_minutes_for_hedge}min left)")
+        if self.add_winner_enabled:
+            logger.info(f"  Add Winner: ✓ {self.add_winner_min_minutes}-{self.add_winner_max_minutes}min, "
+                       f"dist>{self.add_winner_min_distance:.1%}, token>{self.add_winner_min_token_price:.0%}, "
+                       f"max {self.add_winner_max_adds}x")
+        else:
+            logger.info(f"  Add Winner: ✗")
+        logger.info(f"  Signal: cooldown={self.signal_cooldown}s, min_momentum={self.min_momentum:.2%}")
+        logger.info(f"  Filters: RSI={self.rsi_oversold}/{self.rsi_overbought}, spread<{self.max_spread:.0%}, vol>{self.min_volume_ratio:.0%}")
+        
+        # v4 indicators
+        indicators = []
+        if self.use_macd: indicators.append("MACD")
+        if self.use_stochastic: indicators.append(f"Stoch({self.stoch_oversold}/{self.stoch_overbought})")
+        if self.use_adx: indicators.append(f"ADX(>{self.adx_min_strength:.0f})")
+        if self.use_bb_squeeze: indicators.append("BB-Squeeze")
+        if self.use_atr_dynamic: indicators.append("ATR")
+        if self.use_mtf: indicators.append("MTF")
+        if self.use_divergence: indicators.append("Divergence")
+        logger.info(f"  v4 Indicators: {', '.join(indicators) if indicators else '✗'}")
+        
+        if self.use_confidence_scoring:
+            logger.info(f"  Confidence: min={self.min_confidence:.0%}, high={self.high_confidence:.0%} (+{self.high_confidence_multiplier:.1f}x)")
+        
+        if self.use_dynamic_sizing:
+            logger.info(f"  Dynamic Size: win bonus +{self.win_streak_bonus:.0%}/streak (max +{self.max_streak_bonus:.0%})")
+        
+        logger.info(f"  Loss Protection: {self.max_consecutive_losses} max losses → {self.loss_cooldown_seconds}s cooldown")
+        logger.info(f"  Hour Filter: {'✓' if self.use_hour_filter else '✗'} (min winrate={self.min_hour_winrate:.0f}%)")
+        logger.info(f"  Session Filter: {'✓' if self.use_session_filter else '✗'}")
         logger.info(f"  Simulation: {self.simulation_mode}")
         logger.info(f"  Discord: {'✓' if self.discord_webhook else '✗'}")
         logger.info(f"  Dashboard: {'http://localhost:' + str(self.dashboard_port) if self.dashboard_enabled else '✗'}")
-        logger.info(f"  Database: {self.db_path}")
         logger.info("=" * 60)
 
 # ========================== DATA CLASSES ==========================
@@ -222,12 +402,14 @@ class Position:
     # YES side
     yes_shares: float = 0.0
     yes_cost: float = 0.0
-    yes_entry_price: float = 0.0    # First entry price for trailing
+    yes_entry_price: float = 0.0    # First entry price
+    yes_peak_price: float = 0.0     # Highest price since entry (for trailing)
     
     # NO side
     no_shares: float = 0.0
     no_cost: float = 0.0
-    no_entry_price: float = 0.0     # First entry price for trailing
+    no_entry_price: float = 0.0     # First entry price
+    no_peak_price: float = 0.0      # Highest price since entry (for trailing)
     
     # Tracking
     trades: list = field(default_factory=list)
@@ -240,6 +422,10 @@ class Position:
     # Hedge confirmation tracking
     hedge_trigger_time: datetime = None  # When drop first detected
     hedge_trigger_drop: float = 0.0      # Drop % when first detected
+    
+    # Add to winner tracking
+    add_count: int = 0                    # How many times we added to winner
+    add_trigger_time: datetime = None     # When add conditions first detected
     
     @property
     def total_cost(self) -> float:
@@ -260,11 +446,13 @@ class Position:
         if side == "YES":
             if self.yes_shares == 0:
                 self.yes_entry_price = price  # First entry
+                self.yes_peak_price = price   # Initialize peak
             self.yes_shares += shares
             self.yes_cost += cost
         else:
             if self.no_shares == 0:
                 self.no_entry_price = price   # First entry
+                self.no_peak_price = price    # Initialize peak
             self.no_shares += shares
             self.no_cost += cost
         
@@ -339,11 +527,24 @@ class OrderBook:
         """Mid price"""
         book = self.books.get(token_id, {})
         return book.get('mid', 0.5)
+    
+    def get_spread(self, token_id: str) -> float:
+        """Get spread as percentage of mid price"""
+        book = self.books.get(token_id, {})
+        best_bid = book.get('best_bid', 0)
+        best_ask = book.get('best_ask', 1)
+        mid = book.get('mid', 0.5)
+        
+        if mid <= 0:
+            return 1.0  # 100% spread if no mid
+        
+        spread = (best_ask - best_bid) / mid
+        return spread
 
 # ========================== BINANCE (for initial momentum & settlement) ==========================
 
 class BinanceClient:
-    """Get momentum signal from Binance"""
+    """Get momentum signal, RSI and volume from Binance"""
     
     SYMBOL_MAP = {
         "BTC": "BTCUSDT",
@@ -354,6 +555,8 @@ class BinanceClient:
     
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self._klines_cache: dict = {}  # Cache klines to avoid excessive API calls
+        self._cache_time: dict = {}
         
     async def start(self):
         self.session = aiohttp.ClientSession()
@@ -362,24 +565,41 @@ class BinanceClient:
         if self.session:
             await self.session.close()
     
-    async def get_momentum(self, symbol: str, window: int = 5) -> tuple[float, float]:
-        """Get momentum % change and current price"""
+    async def _get_klines(self, symbol: str, limit: int = 50) -> list:
+        """Get klines with caching (refreshes every 10s)"""
         binance_symbol = self.SYMBOL_MAP.get(symbol)
         if not binance_symbol or not self.session:
-            return 0.0, 0.0
+            return []
+        
+        cache_key = f"{symbol}_{limit}"
+        now = time.time()
+        
+        # Use cache if fresh (< 10s)
+        if cache_key in self._klines_cache and (now - self._cache_time.get(cache_key, 0)) < 10:
+            return self._klines_cache[cache_key]
         
         try:
-            url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval=1m&limit={window + 1}"
+            url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval=1m&limit={limit}"
             async with self.session.get(url, timeout=5) as resp:
                 if resp.status == 200:
                     klines = await resp.json()
-                    if len(klines) >= 2:
-                        old_close = float(klines[0][4])
-                        new_close = float(klines[-1][4])
-                        momentum = ((new_close - old_close) / old_close) * 100
-                        return momentum, new_close
+                    self._klines_cache[cache_key] = klines
+                    self._cache_time[cache_key] = now
+                    return klines
         except Exception as e:
-            logger.error(f"[{symbol}] Binance error: {e}")
+            logger.debug(f"[{symbol}] Binance klines error: {e}")
+        
+        return self._klines_cache.get(cache_key, [])
+    
+    async def get_momentum(self, symbol: str, window: int = 5) -> tuple[float, float]:
+        """Get momentum % change and current price"""
+        klines = await self._get_klines(symbol, window + 1)
+        
+        if len(klines) >= 2:
+            old_close = float(klines[0][4])
+            new_close = float(klines[-1][4])
+            momentum = ((new_close - old_close) / old_close) * 100
+            return momentum, new_close
         
         return 0.0, 0.0
     
@@ -398,6 +618,296 @@ class BinanceClient:
         except:
             pass
         return 0.0
+    
+    async def get_rsi(self, symbol: str, period: int = 14) -> float:
+        """Calculate RSI (Relative Strength Index)"""
+        klines = await self._get_klines(symbol, period + 2)
+        
+        if len(klines) < period + 1:
+            return 50.0  # Neutral if not enough data
+        
+        # Get closing prices
+        closes = [float(k[4]) for k in klines]
+        
+        # Calculate price changes
+        changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        
+        # Separate gains and losses
+        gains = [c if c > 0 else 0 for c in changes]
+        losses = [-c if c < 0 else 0 for c in changes]
+        
+        # Calculate average gain/loss
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+    
+    async def get_volume_ratio(self, symbol: str, window: int = 20) -> float:
+        """Get current volume vs average volume ratio"""
+        klines = await self._get_klines(symbol, window + 1)
+        
+        if len(klines) < window:
+            return 1.0  # Neutral if not enough data
+        
+        # Get volumes
+        volumes = [float(k[5]) for k in klines]
+        
+        current_volume = volumes[-1]
+        avg_volume = sum(volumes[:-1]) / len(volumes[:-1])
+        
+        if avg_volume == 0:
+            return 1.0
+        
+        return current_volume / avg_volume
+    
+    async def get_full_analysis(self, symbol: str, rsi_period: int = 14) -> dict:
+        """Get all indicators at once (efficient - uses cached klines)"""
+        # Get more klines for all indicators (need ~50 for ADX, BB, etc.)
+        klines = await self._get_klines(symbol, 60)
+        
+        result = {
+            'price': 0.0,
+            'momentum': 0.0,
+            'rsi': 50.0,
+            'volume_ratio': 1.0,
+            'macd': 0.0,
+            'macd_signal': 0.0,
+            'macd_histogram': 0.0,
+            'macd_bullish': False,
+            'stoch_k': 50.0,
+            'stoch_d': 50.0,
+            'adx': 0.0,
+            'plus_di': 0.0,
+            'minus_di': 0.0,
+            'atr': 0.0,
+            'atr_percent': 0.0,
+            'bb_upper': 0.0,
+            'bb_middle': 0.0,
+            'bb_lower': 0.0,
+            'bb_width': 0.0,
+            'bb_squeeze': False,
+            'divergence': None,
+        }
+        
+        if len(klines) < 2:
+            return result
+        
+        # Parse OHLCV data
+        opens = [float(k[1]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
+        
+        # Current price
+        result['price'] = closes[-1]
+        
+        # Momentum (5 candles)
+        if len(closes) >= 6:
+            result['momentum'] = ((closes[-1] - closes[-6]) / closes[-6]) * 100
+        
+        # RSI
+        if len(closes) >= rsi_period + 1:
+            changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+            gains = [c if c > 0 else 0 for c in changes]
+            losses = [-c if c < 0 else 0 for c in changes]
+            avg_gain = sum(gains[-rsi_period:]) / rsi_period
+            avg_loss = sum(losses[-rsi_period:]) / rsi_period
+            if avg_loss > 0:
+                rs = avg_gain / avg_loss
+                result['rsi'] = 100 - (100 / (1 + rs))
+            else:
+                result['rsi'] = 100.0
+        
+        # Volume ratio
+        if len(volumes) >= 2:
+            current_vol = volumes[-1]
+            avg_vol = sum(volumes[:-1]) / len(volumes[:-1])
+            if avg_vol > 0:
+                result['volume_ratio'] = current_vol / avg_vol
+        
+        # === MACD (12, 26, 9) ===
+        if len(closes) >= 26:
+            ema12 = self._ema(closes, 12)
+            ema26 = self._ema(closes, 26)
+            macd_line = [ema12[i] - ema26[i] for i in range(len(ema26))]
+            signal_line = self._ema(macd_line, 9)
+            
+            if signal_line:
+                result['macd'] = macd_line[-1]
+                result['macd_signal'] = signal_line[-1]
+                result['macd_histogram'] = macd_line[-1] - signal_line[-1]
+                # MACD bullish = histogram positive or crossing up
+                result['macd_bullish'] = result['macd_histogram'] > 0
+        
+        # === Stochastic (14, 3) ===
+        if len(closes) >= 14:
+            stoch_k_values = []
+            for i in range(14, len(closes) + 1):
+                period_highs = highs[i-14:i]
+                period_lows = lows[i-14:i]
+                highest = max(period_highs)
+                lowest = min(period_lows)
+                if highest != lowest:
+                    k = ((closes[i-1] - lowest) / (highest - lowest)) * 100
+                else:
+                    k = 50.0
+                stoch_k_values.append(k)
+            
+            if len(stoch_k_values) >= 3:
+                result['stoch_k'] = stoch_k_values[-1]
+                result['stoch_d'] = sum(stoch_k_values[-3:]) / 3  # 3-period SMA of %K
+        
+        # === ADX (14) ===
+        if len(closes) >= 28:  # Need 2x period for proper ADX
+            tr_list = []
+            plus_dm_list = []
+            minus_dm_list = []
+            
+            for i in range(1, len(closes)):
+                tr = max(
+                    highs[i] - lows[i],
+                    abs(highs[i] - closes[i-1]),
+                    abs(lows[i] - closes[i-1])
+                )
+                tr_list.append(tr)
+                
+                up_move = highs[i] - highs[i-1]
+                down_move = lows[i-1] - lows[i]
+                
+                plus_dm = up_move if (up_move > down_move and up_move > 0) else 0
+                minus_dm = down_move if (down_move > up_move and down_move > 0) else 0
+                
+                plus_dm_list.append(plus_dm)
+                minus_dm_list.append(minus_dm)
+            
+            if len(tr_list) >= 14:
+                # Smoothed averages (Wilder's smoothing)
+                atr14 = sum(tr_list[-14:]) / 14
+                plus_dm14 = sum(plus_dm_list[-14:]) / 14
+                minus_dm14 = sum(minus_dm_list[-14:]) / 14
+                
+                # +DI and -DI
+                plus_di = (plus_dm14 / atr14) * 100 if atr14 > 0 else 0
+                minus_di = (minus_dm14 / atr14) * 100 if atr14 > 0 else 0
+                
+                result['plus_di'] = plus_di
+                result['minus_di'] = minus_di
+                result['atr'] = atr14
+                result['atr_percent'] = (atr14 / closes[-1]) * 100 if closes[-1] > 0 else 0
+                
+                # DX and ADX
+                di_sum = plus_di + minus_di
+                if di_sum > 0:
+                    dx = abs(plus_di - minus_di) / di_sum * 100
+                    # For proper ADX we'd need historical DX values, simplified here
+                    result['adx'] = dx
+        
+        # === Bollinger Bands (20, 2) ===
+        if len(closes) >= 20:
+            sma20 = sum(closes[-20:]) / 20
+            variance = sum((c - sma20) ** 2 for c in closes[-20:]) / 20
+            std_dev = variance ** 0.5
+            
+            result['bb_middle'] = sma20
+            result['bb_upper'] = sma20 + (2 * std_dev)
+            result['bb_lower'] = sma20 - (2 * std_dev)
+            result['bb_width'] = (result['bb_upper'] - result['bb_lower']) / sma20 if sma20 > 0 else 0
+            
+            # Squeeze detection: BB width < 2% of price
+            result['bb_squeeze'] = result['bb_width'] < 0.02
+        
+        # === Divergence Detection ===
+        if len(closes) >= 10 and 'rsi' in result:
+            # Compare last 5 candles with previous 5
+            recent_price_trend = closes[-1] - closes[-5]
+            
+            # Calculate RSI for position -5
+            if len(closes) >= rsi_period + 6:
+                old_closes = closes[:-5]
+                old_changes = [old_closes[i] - old_closes[i-1] for i in range(1, len(old_closes))]
+                old_gains = [c if c > 0 else 0 for c in old_changes]
+                old_losses = [-c if c < 0 else 0 for c in old_changes]
+                old_avg_gain = sum(old_gains[-rsi_period:]) / rsi_period
+                old_avg_loss = sum(old_losses[-rsi_period:]) / rsi_period
+                if old_avg_loss > 0:
+                    old_rs = old_avg_gain / old_avg_loss
+                    old_rsi = 100 - (100 / (1 + old_rs))
+                else:
+                    old_rsi = 100.0
+                
+                rsi_trend = result['rsi'] - old_rsi
+                
+                # Bullish divergence: price down, RSI up
+                if recent_price_trend < 0 and rsi_trend > 5:
+                    result['divergence'] = 'BULLISH'
+                # Bearish divergence: price up, RSI down
+                elif recent_price_trend > 0 and rsi_trend < -5:
+                    result['divergence'] = 'BEARISH'
+        
+        return result
+    
+    def _ema(self, data: list, period: int) -> list:
+        """Calculate EMA"""
+        if len(data) < period:
+            return []
+        
+        multiplier = 2 / (period + 1)
+        ema = [sum(data[:period]) / period]  # Start with SMA
+        
+        for price in data[period:]:
+            ema.append((price - ema[-1]) * multiplier + ema[-1])
+        
+        return ema
+    
+    async def get_higher_timeframe_trend(self, symbol: str) -> str:
+        """Get trend from 5-minute timeframe"""
+        binance_symbol = self.SYMBOL_MAP.get(symbol)
+        if not binance_symbol or not self.session:
+            return "NEUTRAL"
+        
+        cache_key = f"{symbol}_5m"
+        now = time.time()
+        
+        # Cache for 30s (5m data doesn't change as fast)
+        if cache_key in self._klines_cache and (now - self._cache_time.get(cache_key, 0)) < 30:
+            klines = self._klines_cache[cache_key]
+        else:
+            try:
+                url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval=5m&limit=20"
+                async with self.session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        klines = await resp.json()
+                        self._klines_cache[cache_key] = klines
+                        self._cache_time[cache_key] = now
+                    else:
+                        return "NEUTRAL"
+            except:
+                return "NEUTRAL"
+        
+        if len(klines) < 20:
+            return "NEUTRAL"
+        
+        closes = [float(k[4]) for k in klines]
+        
+        # SMA 8 vs SMA 20
+        sma8 = sum(closes[-8:]) / 8
+        sma20 = sum(closes) / 20
+        
+        # Also check momentum
+        momentum = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if closes[-5] > 0 else 0
+        
+        if sma8 > sma20 and momentum > 0:
+            return "BULLISH"
+        elif sma8 < sma20 and momentum < 0:
+            return "BEARISH"
+        return "NEUTRAL"
 
 # ========================== DATABASE ==========================
 
@@ -706,6 +1216,7 @@ class PolyNeko:
         self.stats = {
             'trades': 0,
             'hedges': 0,
+            'adds': 0,
             'wss_messages': 0,
             'slots': 0,
             'total_pnl': 0.0,
@@ -714,6 +1225,13 @@ class PolyNeko:
             'orders_failed': 0,
             'start_time': time.time(),
         }
+        
+        # v4: Win/Loss tracking for dynamic sizing
+        self.win_streak: int = 0
+        self.consecutive_losses: int = 0
+        self.last_loss_time: float = 0.0
+        self.session_wins: int = 0
+        self.session_losses: int = 0
         
         # Dashboard
         self.dashboard = None
@@ -786,6 +1304,42 @@ class PolyNeko:
                 logger.info(f"  POLYMARKET_PASSPHRASE={creds.api_passphrase}")
             except Exception as e:
                 logger.error(f"API credentials error: {e}")
+    
+    # ==================== HELPERS ====================
+    
+    def get_minutes_to_slot_end(self) -> float:
+        """Get minutes remaining in current 15-minute slot"""
+        now = datetime.now(tz=ZoneInfo("America/New_York"))
+        minutes_into_slot = now.minute % 15
+        seconds_into_slot = minutes_into_slot * 60 + now.second
+        seconds_remaining = (15 * 60) - seconds_into_slot
+        return seconds_remaining / 60
+    
+    def get_dynamic_trail_trigger(self) -> float:
+        """Get trail trigger based on time left in slot"""
+        minutes_left = self.get_minutes_to_slot_end()
+        
+        if minutes_left < 3:
+            return self.config.trail_trigger_late
+        elif minutes_left < 7:
+            return self.config.trail_trigger_mid
+        else:
+            return self.config.trail_trigger_early
+    
+    def get_hedge_trigger_for_count(self, hedge_count: int) -> float:
+        """Get the trigger threshold for given hedge number"""
+        triggers = self.config.hedge_triggers
+        if hedge_count < len(triggers):
+            return triggers[hedge_count]
+        return triggers[-1]  # Use last trigger if exceeded
+    
+    def calculate_hedge_size(self, base_size: float, price_drop: float) -> float:
+        """Calculate hedge size, optionally scaled by drop magnitude"""
+        if self.config.hedge_scale_with_drop:
+            # Scale: 10% drop = 100% of base, 20% drop = 150%, 30% drop = 200%
+            scale = 1.0 + (price_drop * 5)  # 5x multiplier on drop
+            return base_size * min(scale, 3.0)  # Cap at 3x
+        return base_size
     
     # ==================== MARKET DISCOVERY ====================
     
@@ -901,10 +1455,165 @@ class PolyNeko:
         except Exception as e:
             logger.debug(f"Message handling error: {e}")
     
+    # ==================== v4 HELPER METHODS ====================
+    
+    def calculate_confidence(self, analysis: dict, direction: str) -> tuple[float, list]:
+        """
+        Calculate confidence score (0-1) based on all indicators.
+        Returns (score, reasons) tuple.
+        """
+        score = 0.0
+        max_score = 0.0
+        reasons = []
+        
+        # 1. Momentum alignment (+1)
+        max_score += 1
+        momentum = analysis.get('momentum', 0)
+        if (direction == 'UP' and momentum > 0) or (direction == 'DOWN' and momentum < 0):
+            score += 1
+            reasons.append(f"mom={momentum:+.2f}%")
+        
+        # 2. RSI alignment (+1)
+        max_score += 1
+        rsi = analysis.get('rsi', 50)
+        if direction == 'UP' and rsi < 50:
+            score += 1
+            reasons.append(f"RSI={rsi:.0f}<50")
+        elif direction == 'DOWN' and rsi > 50:
+            score += 1
+            reasons.append(f"RSI={rsi:.0f}>50")
+        
+        # 3. MACD alignment (+1)
+        if self.config.use_macd:
+            max_score += 1
+            macd_bullish = analysis.get('macd_bullish', False)
+            if (direction == 'UP' and macd_bullish) or (direction == 'DOWN' and not macd_bullish):
+                score += 1
+                reasons.append("MACD✓")
+        
+        # 4. Stochastic alignment (+1)
+        if self.config.use_stochastic:
+            max_score += 1
+            stoch_k = analysis.get('stoch_k', 50)
+            if direction == 'UP' and stoch_k < self.config.stoch_overbought:
+                score += 1
+                reasons.append(f"Stoch={stoch_k:.0f}")
+            elif direction == 'DOWN' and stoch_k > self.config.stoch_oversold:
+                score += 1
+                reasons.append(f"Stoch={stoch_k:.0f}")
+        
+        # 5. ADX strength (+1 or +2)
+        if self.config.use_adx:
+            max_score += 2
+            adx = analysis.get('adx', 0)
+            if adx > self.config.adx_strong:
+                score += 2
+                reasons.append(f"ADX={adx:.0f}🔥")
+            elif adx > self.config.adx_min_strength:
+                score += 1
+                reasons.append(f"ADX={adx:.0f}")
+        
+        # 6. Volume confirmation (+1)
+        max_score += 1
+        volume_ratio = analysis.get('volume_ratio', 1)
+        if volume_ratio >= 1.2:
+            score += 1
+            reasons.append(f"vol={volume_ratio:.1f}x")
+        
+        # 7. Divergence bonus (+1.5)
+        if self.config.use_divergence:
+            max_score += 1.5
+            divergence = analysis.get('divergence')
+            if divergence == 'BULLISH' and direction == 'UP':
+                score += 1.5
+                reasons.append("DIV🔼")
+            elif divergence == 'BEARISH' and direction == 'DOWN':
+                score += 1.5
+                reasons.append("DIV🔽")
+        
+        # 8. BB Squeeze (potential breakout) (+0.5)
+        if self.config.use_bb_squeeze:
+            max_score += 0.5
+            if analysis.get('bb_squeeze', False):
+                score += 0.5
+                reasons.append("BB-SQZ")
+        
+        # Normalize to 0-1
+        confidence = score / max_score if max_score > 0 else 0
+        
+        return confidence, reasons
+    
+    def is_good_session(self) -> bool:
+        """Check if current time is in active trading session"""
+        if not self.config.use_session_filter:
+            return True
+        
+        hour = datetime.now(timezone.utc).hour
+        for start, end in self.config.active_sessions:
+            if start <= hour < end:
+                return True
+        return False
+    
+    def check_loss_cooldown(self) -> bool:
+        """Check if we're in loss cooldown period. Returns True if OK to trade."""
+        if self.consecutive_losses < self.config.max_consecutive_losses:
+            return True
+        
+        elapsed = time.time() - self.last_loss_time
+        if elapsed >= self.config.loss_cooldown_seconds:
+            # Reset after cooldown
+            self.consecutive_losses = 0
+            logger.info("🔄 Loss cooldown ended, resuming trading")
+            return True
+        
+        remaining = self.config.loss_cooldown_seconds - elapsed
+        logger.debug(f"⏸️ Loss cooldown: {remaining:.0f}s remaining")
+        return False
+    
+    def get_dynamic_bet_size(self, base_size: float, confidence: float) -> float:
+        """Calculate dynamic bet size based on confidence and win streak"""
+        size = base_size
+        
+        if not self.config.use_dynamic_sizing:
+            return size
+        
+        # Confidence multiplier
+        if self.config.use_confidence_scoring:
+            if confidence >= self.config.high_confidence:
+                size *= self.config.high_confidence_multiplier
+            elif confidence < self.config.min_confidence:
+                size *= 0.5  # Reduce for low confidence
+        
+        # Win streak bonus
+        streak_bonus = min(self.win_streak * self.config.win_streak_bonus, 
+                          self.config.max_streak_bonus)
+        size *= (1 + streak_bonus)
+        
+        # Loss penalty
+        if self.consecutive_losses > 0:
+            size *= self.config.loss_size_reduction
+        
+        return size
+    
+    def update_win_loss(self, won: bool):
+        """Update win/loss tracking after settlement"""
+        if won:
+            self.win_streak += 1
+            self.consecutive_losses = 0
+            self.session_wins += 1
+        else:
+            self.win_streak = 0
+            self.consecutive_losses += 1
+            self.last_loss_time = time.time()
+            self.session_losses += 1
+            
+            if self.consecutive_losses >= self.config.max_consecutive_losses:
+                logger.warning(f"⚠️ {self.consecutive_losses} consecutive losses - entering cooldown for {self.config.loss_cooldown_seconds}s")
+    
     # ==================== TRADING LOGIC ====================
     
     async def check_signals(self, slug: str):
-        """Check if we should trade based on current token prices"""
+        """Check if we should trade based on current token prices and indicators"""
         market = self.active_markets.get(slug)
         if not market:
             return
@@ -927,6 +1636,14 @@ class PolyNeko:
         
         pos = self.positions[slug]
         
+        # Update peak prices (track highest value since entry)
+        if pos.yes_shares > 0 and yes_price > pos.yes_peak_price:
+            pos.yes_peak_price = yes_price
+            logger.debug(f"[{symbol}] YES new peak: ${yes_price:.3f}")
+        if pos.no_shares > 0 and no_price > pos.no_peak_price:
+            pos.no_peak_price = no_price
+            logger.debug(f"[{symbol}] NO new peak: ${no_price:.3f}")
+        
         # Check cooldown
         now = datetime.now(timezone.utc)
         seconds_since_last = (now - pos.last_trade_time).total_seconds()
@@ -940,117 +1657,335 @@ class PolyNeko:
             if pos.total_cost >= self.config.max_position:
                 logger.debug(f"[{symbol}] Max position reached: ${pos.total_cost:.2f}")
                 return
-                
-            # Get momentum from Binance for initial direction
-            momentum, _ = await self.binance.get_momentum(symbol)
             
-            logger.debug(f"[{symbol}] Momentum check: {momentum:.4f}%")
-            
-            if abs(momentum) < 0.05:  # Need at least 0.05% move
+            # v4: Check loss cooldown
+            if not self.check_loss_cooldown():
                 return
             
-            if momentum > 0:
-                # Bullish - buy YES
-                logger.info(f"[{symbol}] 📈 SIGNAL: BUY YES (momentum +{momentum:.3f}%)")
-                await self.place_trade(pos, "YES", yes_price, f"Initial: momentum +{momentum:.3f}%")
+            # v4: Check session filter
+            if not self.is_good_session():
+                logger.debug(f"[{symbol}] Outside active session")
+                return
+            
+            # === ENTRY FILTERS ===
+            
+            # 1. Spread check
+            yes_spread = self.orderbook.get_spread(yes_token)
+            no_spread = self.orderbook.get_spread(no_token)
+            if yes_spread > self.config.max_spread or no_spread > self.config.max_spread:
+                logger.debug(f"[{symbol}] Spread too wide: YES={yes_spread:.1%}, NO={no_spread:.1%}")
+                return
+            
+            # 2. Get full Binance analysis (all indicators)
+            analysis = await self.binance.get_full_analysis(symbol, self.config.rsi_period)
+            momentum = analysis['momentum']
+            rsi = analysis['rsi']
+            volume_ratio = analysis['volume_ratio']
+            adx = analysis.get('adx', 0)
+            
+            logger.debug(f"[{symbol}] Analysis: mom={momentum:.3f}%, RSI={rsi:.1f}, ADX={adx:.0f}, vol={volume_ratio:.2f}")
+            
+            # 3. Basic momentum check
+            if abs(momentum) < self.config.min_momentum:
+                logger.debug(f"[{symbol}] Momentum too weak: {momentum:.3f}% < {self.config.min_momentum:.2%}")
+                return
+            
+            # 4. Volume check
+            if volume_ratio < self.config.min_volume_ratio:
+                logger.debug(f"[{symbol}] Volume too low: {volume_ratio:.2f} < {self.config.min_volume_ratio}")
+                return
+            
+            # 5. v4: ADX filter (skip weak trends)
+            if self.config.use_adx and adx < self.config.adx_min_strength:
+                logger.debug(f"[{symbol}] ADX too weak: {adx:.0f} < {self.config.adx_min_strength:.0f} (sideways market)")
+                return
+            
+            # 6. Hour performance filter
+            if self.config.use_hour_filter:
+                hour_stats = self.db.get_performance_by_hour()
+                current_hour = datetime.now().strftime('%H')
+                for stat in hour_stats:
+                    if stat['hour'] == current_hour:
+                        trades = stat['trades']
+                        wins = stat['wins']
+                        if trades >= 10:
+                            win_rate = (wins / trades) * 100
+                            if win_rate < self.config.min_hour_winrate:
+                                logger.info(f"[{symbol}] ⏰ SKIP: Hour {current_hour}:00 has {win_rate:.0f}% win rate < {self.config.min_hour_winrate:.0f}%")
+                                return
+                        break
+            
+            # 7. v4: Multi-timeframe confirmation
+            htf_trend = "NEUTRAL"
+            if self.config.use_mtf:
+                htf_trend = await self.binance.get_higher_timeframe_trend(symbol)
+            
+            # Determine direction
+            direction = "UP" if momentum > 0 else "DOWN"
+            
+            # v4: MTF alignment check
+            if self.config.use_mtf:
+                if direction == "UP" and htf_trend == "BEARISH":
+                    logger.info(f"[{symbol}] ⚠️ SKIP: MTF misalignment (1m=UP, 5m=BEARISH)")
+                    return
+                elif direction == "DOWN" and htf_trend == "BULLISH":
+                    logger.info(f"[{symbol}] ⚠️ SKIP: MTF misalignment (1m=DOWN, 5m=BULLISH)")
+                    return
+            
+            # RSI extremes filter
+            if direction == "UP" and rsi > self.config.rsi_overbought:
+                logger.info(f"[{symbol}] ⚠️ SKIP YES: RSI {rsi:.0f} > {self.config.rsi_overbought:.0f} (overbought)")
+                return
+            elif direction == "DOWN" and rsi < self.config.rsi_oversold:
+                logger.info(f"[{symbol}] ⚠️ SKIP NO: RSI {rsi:.0f} < {self.config.rsi_oversold:.0f} (oversold)")
+                return
+            
+            # Stochastic extremes filter
+            if self.config.use_stochastic:
+                stoch_k = analysis.get('stoch_k', 50)
+                if direction == "UP" and stoch_k > self.config.stoch_overbought:
+                    logger.info(f"[{symbol}] ⚠️ SKIP YES: Stoch {stoch_k:.0f} > {self.config.stoch_overbought:.0f} (overbought)")
+                    return
+                elif direction == "DOWN" and stoch_k < self.config.stoch_oversold:
+                    logger.info(f"[{symbol}] ⚠️ SKIP NO: Stoch {stoch_k:.0f} < {self.config.stoch_oversold:.0f} (oversold)")
+                    return
+            
+            # v4: Calculate confidence score
+            confidence, reasons = self.calculate_confidence(analysis, direction)
+            
+            # Add HTF to reasons if aligned
+            if htf_trend == ("BULLISH" if direction == "UP" else "BEARISH"):
+                reasons.append(f"MTF={htf_trend}")
+            
+            # v4: Confidence threshold
+            if self.config.use_confidence_scoring and confidence < self.config.min_confidence:
+                logger.info(f"[{symbol}] ⚠️ SKIP: Confidence {confidence:.0%} < {self.config.min_confidence:.0%}")
+                return
+            
+            # v4: Calculate dynamic bet size
+            base_bet = self.config.bet_size
+            dynamic_bet = self.get_dynamic_bet_size(base_bet, confidence)
+            
+            # Build reason string
+            reason_str = ", ".join(reasons[:5])  # Limit to 5 reasons
+            conf_emoji = "🔥" if confidence >= self.config.high_confidence else "✓"
+            
+            # Execute trade
+            if direction == "UP":
+                logger.info(f"[{symbol}] 📈 {conf_emoji} BUY YES (conf={confidence:.0%}, {reason_str})")
+                await self.place_trade(pos, "YES", yes_price, 
+                    f"Initial: conf={confidence:.0%}, {reason_str}",
+                    confidence=confidence)
             else:
-                # Bearish - buy NO  
-                logger.info(f"[{symbol}] 📉 SIGNAL: BUY NO (momentum {momentum:.3f}%)")
-                await self.place_trade(pos, "NO", no_price, f"Initial: momentum {momentum:.3f}%")
+                logger.info(f"[{symbol}] 📉 {conf_emoji} BUY NO (conf={confidence:.0%}, {reason_str})")
+                await self.place_trade(pos, "NO", no_price,
+                    f"Initial: conf={confidence:.0%}, {reason_str}",
+                    confidence=confidence)
             return
         
-        # === TRAILING / HEDGE LOGIC ===
-        if pos.hedge_count >= self.config.max_hedges:
-            logger.debug(f"[{symbol}] Max hedges reached: {pos.hedge_count}/{self.config.max_hedges}")
-            return  # Max hedges reached
-        
+        # === SHARED SETUP (for hedge and add_winner) ===
+        minutes_left = self.get_minutes_to_slot_end()
+        binance_price = await self.binance.get_price(symbol)
+        start_price = self.start_prices.get(symbol, 0)
         now = datetime.now(timezone.utc)
         
-        # Check if token price moved against us
-        if pos.initial_side == "YES" and pos.yes_entry_price > 0:
-            # We bet YES, check if YES token price dropped
-            price_drop = (pos.yes_entry_price - yes_price) / pos.yes_entry_price
-            
-            if price_drop >= self.config.trail_trigger:
-                # Drop detected - check if it persists
-                if pos.hedge_trigger_time is None:
-                    # First time seeing drop - start timer
-                    pos.hedge_trigger_time = now
-                    pos.hedge_trigger_drop = price_drop
-                    logger.info(f"[{symbol}] ⏱️ HEDGE PENDING: YES dropped {price_drop:.0%}, waiting {self.config.hedge_confirm_seconds}s...")
-                else:
-                    # Check if enough time passed
-                    elapsed = (now - pos.hedge_trigger_time).total_seconds()
-                    if elapsed >= self.config.hedge_confirm_seconds:
-                        # Confirmed! Execute hedge
-                        logger.info(f"[{symbol}] 🛡️ HEDGE CONFIRMED: YES dropped {price_drop:.0%} for {elapsed:.0f}s")
-                        await self.place_trade(
-                            pos, "NO", no_price, 
-                            f"HEDGE: YES ${pos.yes_entry_price:.2f}→${yes_price:.2f} (-{price_drop:.0%})",
-                            is_hedge=True
-                        )
-                        # Reset trigger after hedge
-                        pos.hedge_trigger_time = None
-                        pos.hedge_trigger_drop = 0
-                    else:
-                        logger.debug(f"[{symbol}] YES drop={price_drop:.0%}, waiting... ({elapsed:.0f}s/{self.config.hedge_confirm_seconds}s)")
-            else:
-                # Drop recovered - reset timer
-                if pos.hedge_trigger_time is not None:
-                    logger.info(f"[{symbol}] ✅ DROP RECOVERED: YES back to ${yes_price:.3f} (was -{pos.hedge_trigger_drop:.0%})")
-                    pos.hedge_trigger_time = None
-                    pos.hedge_trigger_drop = 0
+        # === HEDGE LOGIC ===
+        can_hedge = (
+            pos.hedge_count < self.config.max_hedges and
+            minutes_left >= self.config.min_minutes_for_hedge and
+            binance_price and start_price
+        )
         
-        elif pos.initial_side == "NO" and pos.no_entry_price > 0:
-            # We bet NO, check if NO token price dropped
-            price_drop = (pos.no_entry_price - no_price) / pos.no_entry_price
+        if can_hedge:
+            # Get dynamic trail trigger based on time
+            trail_trigger = self.get_dynamic_trail_trigger()
+            hedge_threshold = self.get_hedge_trigger_for_count(pos.hedge_count)
+            effective_trigger = max(trail_trigger, hedge_threshold)
             
-            if price_drop >= self.config.trail_trigger:
-                # Drop detected - check if it persists
-                if pos.hedge_trigger_time is None:
-                    # First time seeing drop - start timer
-                    pos.hedge_trigger_time = now
-                    pos.hedge_trigger_drop = price_drop
-                    logger.info(f"[{symbol}] ⏱️ HEDGE PENDING: NO dropped {price_drop:.0%}, waiting {self.config.hedge_confirm_seconds}s...")
+            # Volume check for hedge (optional)
+            volume_ok = True
+            if self.config.require_volume_for_hedge:
+                volume_ratio = await self.binance.get_volume_ratio(symbol)
+                volume_ok = volume_ratio >= self.config.min_volume_ratio
+            
+            if pos.initial_side == "YES" and pos.yes_peak_price > 0:
+                price_drop = (pos.yes_peak_price - yes_price) / pos.yes_peak_price
+                binance_losing = binance_price < start_price
+                binance_change = ((binance_price - start_price) / start_price) * 100
+                
+                if price_drop >= effective_trigger and binance_losing and volume_ok:
+                    if pos.hedge_trigger_time is None:
+                        pos.hedge_trigger_time = now
+                        pos.hedge_trigger_drop = price_drop
+                        logger.info(f"[{symbol}] ⏱️ HEDGE PENDING #{pos.hedge_count+1}: "
+                                   f"YES dropped {price_drop:.0%} from peak ${pos.yes_peak_price:.3f} (trigger={effective_trigger:.0%}), "
+                                   f"Binance ${binance_price:.2f} < start ${start_price:.2f} ({binance_change:+.2f}%), "
+                                   f"{minutes_left:.1f}min left, waiting {self.config.hedge_confirm_seconds}s...")
+                    else:
+                        elapsed = (now - pos.hedge_trigger_time).total_seconds()
+                        if elapsed >= self.config.hedge_confirm_seconds:
+                            logger.info(f"[{symbol}] 🛡️ HEDGE #{pos.hedge_count+1} CONFIRMED after {elapsed:.0f}s")
+                            await self.place_trade(
+                                pos, "NO", no_price, 
+                                f"HEDGE #{pos.hedge_count+1}: YES -{price_drop:.0%}, Binance {binance_change:+.2f}%",
+                                is_hedge=True,
+                                price_drop=price_drop
+                            )
+                            pos.hedge_trigger_time = None
+                            pos.hedge_trigger_drop = 0
+                        else:
+                            logger.debug(f"[{symbol}] Hedge waiting... ({elapsed:.0f}s/{self.config.hedge_confirm_seconds}s)")
                 else:
-                    # Check if enough time passed
-                    elapsed = (now - pos.hedge_trigger_time).total_seconds()
-                    if elapsed >= self.config.hedge_confirm_seconds:
-                        # Confirmed! Execute hedge
-                        logger.info(f"[{symbol}] 🛡️ HEDGE CONFIRMED: NO dropped {price_drop:.0%} for {elapsed:.0f}s")
-                        await self.place_trade(
-                            pos, "YES", yes_price,
-                            f"HEDGE: NO ${pos.no_entry_price:.2f}→${no_price:.2f} (-{price_drop:.0%})",
-                            is_hedge=True
-                        )
-                        # Reset trigger after hedge
+                    if pos.hedge_trigger_time is not None:
+                        reason = []
+                        if not binance_losing:
+                            reason.append(f"Binance ${binance_price:.2f} >= start")
+                        if price_drop < effective_trigger:
+                            reason.append(f"drop {price_drop:.0%} < trigger {effective_trigger:.0%}")
+                        if not volume_ok:
+                            reason.append("low volume")
+                        logger.info(f"[{symbol}] ✅ HEDGE CANCELLED: {', '.join(reason)}")
                         pos.hedge_trigger_time = None
                         pos.hedge_trigger_drop = 0
+            
+            elif pos.initial_side == "NO" and pos.no_peak_price > 0:
+                price_drop = (pos.no_peak_price - no_price) / pos.no_peak_price
+                binance_losing = binance_price > start_price
+                binance_change = ((binance_price - start_price) / start_price) * 100
+                
+                if price_drop >= effective_trigger and binance_losing and volume_ok:
+                    if pos.hedge_trigger_time is None:
+                        pos.hedge_trigger_time = now
+                        pos.hedge_trigger_drop = price_drop
+                        logger.info(f"[{symbol}] ⏱️ HEDGE PENDING #{pos.hedge_count+1}: "
+                                   f"NO dropped {price_drop:.0%} from peak ${pos.no_peak_price:.3f} (trigger={effective_trigger:.0%}), "
+                                   f"Binance ${binance_price:.2f} > start ${start_price:.2f} ({binance_change:+.2f}%), "
+                                   f"{minutes_left:.1f}min left, waiting {self.config.hedge_confirm_seconds}s...")
                     else:
-                        logger.debug(f"[{symbol}] NO drop={price_drop:.0%}, waiting... ({elapsed:.0f}s/{self.config.hedge_confirm_seconds}s)")
+                        elapsed = (now - pos.hedge_trigger_time).total_seconds()
+                        if elapsed >= self.config.hedge_confirm_seconds:
+                            logger.info(f"[{symbol}] 🛡️ HEDGE #{pos.hedge_count+1} CONFIRMED after {elapsed:.0f}s")
+                            await self.place_trade(
+                                pos, "YES", yes_price,
+                                f"HEDGE #{pos.hedge_count+1}: NO -{price_drop:.0%}, Binance {binance_change:+.2f}%",
+                                is_hedge=True,
+                                price_drop=price_drop
+                            )
+                            pos.hedge_trigger_time = None
+                            pos.hedge_trigger_drop = 0
+                        else:
+                            logger.debug(f"[{symbol}] Hedge waiting... ({elapsed:.0f}s/{self.config.hedge_confirm_seconds}s)")
+                else:
+                    if pos.hedge_trigger_time is not None:
+                        reason = []
+                        if not binance_losing:
+                            reason.append(f"Binance ${binance_price:.2f} <= start")
+                        if price_drop < effective_trigger:
+                            reason.append(f"drop {price_drop:.0%} < trigger {effective_trigger:.0%}")
+                        if not volume_ok:
+                            reason.append("low volume")
+                        logger.info(f"[{symbol}] ✅ HEDGE CANCELLED: {', '.join(reason)}")
+                        pos.hedge_trigger_time = None
+                        pos.hedge_trigger_drop = 0
+        
+        # === ADD TO WINNER LOGIC ===
+        if not self.config.add_winner_enabled:
+            return
+        
+        if pos.add_count >= self.config.add_winner_max_adds:
+            return
+        
+        if not binance_price or not start_price:
+            return
+        
+        # Check time window for add_winner
+        if minutes_left > self.config.add_winner_max_minutes or minutes_left < self.config.add_winner_min_minutes:
+            if pos.add_trigger_time is not None:
+                pos.add_trigger_time = None
+            return
+        
+        # Calculate distance from start
+        binance_distance = abs(binance_price - start_price) / start_price
+        binance_change = ((binance_price - start_price) / start_price) * 100
+        
+        # Check if we're winning and should add
+        should_add = False
+        add_side = None
+        add_price = 0
+        
+        if pos.initial_side == "YES":
+            binance_winning = binance_price > start_price
+            token_safe = yes_price >= self.config.add_winner_min_token_price
+            distance_ok = binance_distance >= self.config.add_winner_min_distance
+            not_hedging = pos.hedge_trigger_time is None
+            
+            if binance_winning and token_safe and distance_ok and not_hedging:
+                should_add = True
+                add_side = "YES"
+                add_price = yes_price
+                
+        elif pos.initial_side == "NO":
+            binance_winning = binance_price < start_price
+            token_safe = no_price >= self.config.add_winner_min_token_price
+            distance_ok = binance_distance >= self.config.add_winner_min_distance
+            not_hedging = pos.hedge_trigger_time is None
+            
+            if binance_winning and token_safe and distance_ok and not_hedging:
+                should_add = True
+                add_side = "NO"
+                add_price = no_price
+        
+        if should_add:
+            if pos.add_trigger_time is None:
+                pos.add_trigger_time = now
+                logger.info(f"[{symbol}] 🎯 ADD PENDING #{pos.add_count+1}: "
+                           f"{add_side}=${add_price:.3f} (>{self.config.add_winner_min_token_price:.0%}), "
+                           f"Binance dist={binance_distance:.2%} (>{self.config.add_winner_min_distance:.1%}), "
+                           f"{minutes_left:.1f}min left, waiting {self.config.add_winner_confirm_seconds}s...")
             else:
-                # Drop recovered - reset timer
-                if pos.hedge_trigger_time is not None:
-                    logger.info(f"[{symbol}] ✅ DROP RECOVERED: NO back to ${no_price:.3f} (was -{pos.hedge_trigger_drop:.0%})")
-                    pos.hedge_trigger_time = None
-                    pos.hedge_trigger_drop = 0
+                elapsed = (now - pos.add_trigger_time).total_seconds()
+                if elapsed >= self.config.add_winner_confirm_seconds:
+                    logger.info(f"[{symbol}] 🚀 ADD #{pos.add_count+1} CONFIRMED after {elapsed:.0f}s")
+                    await self.place_trade(
+                        pos, add_side, add_price,
+                        f"ADD #{pos.add_count+1}: {add_side}=${add_price:.2f}, Binance {binance_change:+.2f}%, {minutes_left:.1f}min left",
+                        is_add=True
+                    )
+                    pos.add_trigger_time = None
+                    pos.add_count += 1
+                else:
+                    logger.debug(f"[{symbol}] Add waiting... ({elapsed:.0f}s/{self.config.add_winner_confirm_seconds}s)")
+        else:
+            if pos.add_trigger_time is not None:
+                logger.info(f"[{symbol}] ✅ ADD CANCELLED: conditions no longer met")
+                pos.add_trigger_time = None
     
-    async def place_trade(self, pos: Position, side: str, price: float, reason: str, is_hedge: bool = False):
+    async def place_trade(self, pos: Position, side: str, price: float, reason: str, is_hedge: bool = False, is_add: bool = False, price_drop: float = 0.0, confidence: float = 0.5):
         """Place a trade"""
         MIN_SHARES = 5  # Polymarket minimum
         
         if price <= 0 or price >= 1:
             return
         
-        # Calculate size
+        # Calculate size based on trade type
         if is_hedge:
-            bet_amount = self.config.bet_size * self.config.trail_size
-            # Hedge is always allowed (up to max_hedges limit checked earlier)
+            base_amount = self.config.bet_size * self.config.trail_size
+            # Scale hedge size based on drop magnitude
+            bet_amount = self.calculate_hedge_size(base_amount, price_drop)
             remaining = bet_amount  # No max_position limit for hedges
+            logger.debug(f"[{pos.symbol}] Hedge size: base=${base_amount:.2f}, scaled=${bet_amount:.2f} (drop={price_drop:.0%})")
+        elif is_add:
+            bet_amount = self.config.bet_size * self.config.add_winner_size
+            remaining = bet_amount  # No max_position limit for adds
+            logger.debug(f"[{pos.symbol}] Add winner size: ${bet_amount:.2f}")
         else:
-            bet_amount = self.config.bet_size
+            # v4: Dynamic bet sizing for initial trades
+            base_amount = self.config.bet_size
+            bet_amount = self.get_dynamic_bet_size(base_amount, confidence)
             remaining = self.config.max_position - pos.total_cost
             bet_amount = min(bet_amount, remaining)
+            if bet_amount != base_amount:
+                logger.debug(f"[{pos.symbol}] Dynamic size: base=${base_amount:.2f}, adjusted=${bet_amount:.2f} (conf={confidence:.0%})")
         
         # Calculate shares
         shares = int(bet_amount / price)
@@ -1079,8 +2014,14 @@ class PolyNeko:
             logger.error(f"[{pos.symbol}] No token_id for {side}")
             return
         
-        # Execute
-        emoji = "🛡️" if is_hedge else "🎲"
+        # Execute - different emoji for each type
+        if is_hedge:
+            emoji = "🛡️"
+        elif is_add:
+            emoji = "🚀"
+        else:
+            emoji = "🎲"
+        
         success = False
         order_id = None
         attempts = 1
@@ -1149,6 +2090,8 @@ class PolyNeko:
             if is_hedge:
                 pos.hedge_count += 1
                 self.stats['hedges'] += 1
+            elif is_add:
+                self.stats['adds'] += 1
             
             self.stats['trades'] += 1
             
@@ -1337,6 +2280,10 @@ class PolyNeko:
                 pnl=pnl,
                 hedge_count=pos.hedge_count
             )
+            
+            # v4: Update win/loss tracking
+            won = (winner == pos.initial_side)
+            self.update_win_loss(won)
         
         # Summary
         logger.info("")
@@ -1361,13 +2308,19 @@ class PolyNeko:
     
     async def start(self):
         logger.info("=" * 60)
-        logger.info(f"POLYNEKO v2 [{'🔬 SIM' if self.config.simulation_mode else '💰 PROD'}]")
+        logger.info(f"POLYNEKO v4 [{'🔬 SIM' if self.config.simulation_mode else '💰 PROD'}]")
         logger.info("=" * 60)
-        logger.info("  Strategy: MOMENTUM + TRAILING HEDGE")
+        logger.info("  Strategy: MULTI-INDICATOR CONFIDENCE SCORING")
         self.config.print_config()
         logger.info("")
-        logger.info("  📊 Monitors Polymarket token prices via WebSocket")
-        logger.info("  🛡️ Hedges when token price drops against position")
+        logger.info("  📊 Entry: Confidence scoring with MACD/Stoch/ADX/BB/ATR")
+        logger.info("  🔍 MTF: Multi-timeframe trend confirmation")
+        logger.info("  🛡️ Hedge: (1) token drops from peak + (2) Binance crosses start")
+        logger.info("  ⏱️ Dynamic triggers based on time remaining")
+        logger.info("  📈 Dynamic bet sizing based on confidence")
+        if self.config.add_winner_enabled:
+            logger.info("  🚀 Add to winner: doubles down when winning near slot end")
+        logger.info("  🛑 Martingale prevention: cooldown after losses")
         
         # Check CLOB availability for production mode
         if not self.config.simulation_mode:
@@ -1394,10 +2347,31 @@ class PolyNeko:
         
         self.running = True
         
+        # Start price monitor loop (checks hedge conditions every 2s)
+        asyncio.create_task(self._price_monitor_loop())
+        
         try:
             await self._main_loop()
         finally:
             await self.stop()
+    
+    async def _price_monitor_loop(self):
+        """Okresowo sprawdzaj ceny i warunki hedge (niezależnie od WebSocket)"""
+        logger.info("📡 Price monitor started (checking every 2s)")
+        
+        while self.running:
+            try:
+                for slug in list(self.positions.keys()):
+                    pos = self.positions.get(slug)
+                    if pos and pos.total_cost > 0 and len(pos.trades) > 0:
+                        await self.check_signals(slug)
+                
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Price monitor error: {e}")
+                await asyncio.sleep(5)
     
     async def stop(self):
         self.running = False
@@ -1481,8 +2455,9 @@ class PolyNeko:
         logger.info("")
         logger.info("=" * 60)
         mode = "SIM" if self.config.simulation_mode else "PROD"
-        logger.info(f"PREDICTION v2 [{mode}] | Trades: {self.stats['trades']} | Hedges: {self.stats['hedges']}")
+        logger.info(f"POLYNEKO v4 [{mode}] | Trades: {self.stats['trades']} | Hedges: {self.stats['hedges']} | Adds: {self.stats['adds']}")
         logger.info(f"WSS msgs: {self.stats['wss_messages']} | Slots: {self.stats['slots']}")
+        logger.info(f"Session: W:{self.session_wins} L:{self.session_losses} | Streak: W{self.win_streak} L{self.consecutive_losses}")
         
         if not self.config.simulation_mode:
             logger.info(f"Orders: {self.stats['orders_sent']} sent, {self.stats['orders_filled']} filled, {self.stats['orders_failed']} failed")
@@ -1492,7 +2467,7 @@ class PolyNeko:
         for slug, pos in self.positions.items():
             if pos.total_cost > 0:
                 logger.info(f"  [{pos.symbol}] {pos.initial_side} | YES={pos.yes_shares:.0f}@${pos.avg_yes_price:.3f} "
-                           f"NO={pos.no_shares:.0f}@${pos.avg_no_price:.3f} | ${pos.total_cost:.2f} | H:{pos.hedge_count}")
+                           f"NO={pos.no_shares:.0f}@${pos.avg_no_price:.3f} | ${pos.total_cost:.2f} | H:{pos.hedge_count} A:{pos.add_count}")
         logger.info("=" * 60)
 
 # ========================== MAIN ==========================
